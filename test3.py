@@ -8,7 +8,7 @@ import os
 
 # ---------- Настройки ----------
 background_files = [
-    r"C:\Users\4ekwk\Downloads\7beN-2699045384.gif"
+    r"D:\novosib_hack_t1_shabbat\hackaton\Shingeki-no-Kyojin-Anime-фэндомы-8027242.jpeg"
 ]
 cap_index = 0            # индекс камеры
 mask_history_len = 5     # усреднение по N кадрам

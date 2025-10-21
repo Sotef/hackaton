@@ -1,6 +1,35 @@
-torch==1.9.0
-torchvision==0.10.0
-segmentation-models-pytorch==0.2.1
-opencv-python==4.5.5.64
-numpy==1.19.5
-Pillow==8.4.0
+﻿# === Core dependencies ===
+numpy>=2.2.0
+opencv-python>=4.10.0
+torch>=2.2.0
+torchvision>=0.17.0
+tqdm
+pillow
+matplotlib
+
+# === Deep Learning / Vision ===
+ultralytics>=8.3.0         # YOLOv8
+mediapipe>=0.10.14         # fallback сегментация
+open_clip_torch>=2.26.0    # CLIP модель
+modnet>=0.4.5              # если используется для фонового сегментирования
+onnxruntime-gpu>=1.17.0    # для ускорения inference
+tensorflow==2.15.1         # (требуется для некоторых TFLite моделей)
+tensorflow-io-gcs-filesystem
+
+# === Utility / System ===
+PyYAML
+requests
+protobuf>=4.25.0
+scipy
+pandas>=2.0.0
+plotly
+pytz
+termcolor
+psutil
+
+# === Optional aesthetic scoring / background ===
+transformers>=4.40.0
+huggingface_hub>=0.24.0
+
+# === GPU acceleration (optional) ===
+cuda-python; platform_system == "Windows"
