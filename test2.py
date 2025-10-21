@@ -1,540 +1,373 @@
-import cv2
-import mediapipe as mp
-import numpy as np
-from collections import deque
-from PIL import Image, ImageSequence
-import time
-import os
 """
-Improved background replacement / person segmentation (test2.py)
+GPU-ready demo pipeline for:
+ - person segmentation (MODNet preferred, Mediapipe fallback)
+ - clothes detection (YOLOv8 via ultralytics)
+ - style classification (OpenCLIP / CLIP zero-shot)
+ - color palette extraction (OpenCV + KMeans)
+ - aesthetic scoring (optional LAION predictor if available)
 
-Includes:
-- configuration via .env (see TEMPLATE_ENV below)
-- fallback logic: try ONNX (onnxruntime-gpu) or PyTorch model if configured and available; otherwise use MediaPipe
-- temporal smoothing (EMA), mask history, distance-transform feathering for clean edges
-- optional guided/bilateral filtering (if opencv contrib available)
-- keyboard controls to toggle GPU mode, hard/soft mask, CLAHE, gif play/pause, debug windows
-- safe fallbacks so script runs even when optional libraries are missing
+This script is intended as a *local* prototype (not a web app) that runs on a machine
+with a GPU and the appropriate model checkpoints installed.
 
-Save a .env next to this file (or edit TEMPLATE_ENV below)
+How to use (example):
+  python gpu_fashion_pipeline.py --source 0 --use_gpu --modnet --yolov8
 
-TEMPLATE_ENV (put exactly into a file named .env in the same folder):
+Notes:
+ - The script tries to import optional dependencies and will run in a degraded mode
+   (mocked behavior) if they are not present. This makes it easy to test parts
+   of the pipeline without all large checkpoints.
+ - You must download model checkpoints manually (instructions below). The script
+   expects them in ./models/ by default.
 
-# ---------- .env sample ----------
-# Camera index (int)
-CAP_INDEX=0
-# Paths to backgrounds separated by semicolon (GIFs or images allowed)
-BACKGROUND_FILES=C:/Users/4ekwk/Downloads/7beN-2699045384.gif
-# Mask smoothing length for history averaging (int)
-MASK_HISTORY_LEN=5
-# Hard threshold [0..1] for binarization
-HARD_THRESH=0.5
-# Apply CLAHE on V channel (True/False)
-APPLY_CLAHE=True
-# Morphology kernel size (odd int)
-MORPH_KERNEL=3
-# Use GPU if possible (True/False). This will try ONNXRuntime-GPU or PyTorch if an external model path is configured.
-USE_GPU=False
-# Path to optional ONNX segmentation model (if empty, MediaPipe will be used)
-ONNX_MODEL_PATH=
-# Use stronger temporal smoothing alpha (0..1). Lower = slower smoothing.
-EMA_ALPHA=0.4
-# Edge feathering radius in pixels
-FEATHER_RADIUS=20
-# ----------------------------------
+Recommended pip installs:
+  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121  # match your CUDA
+  pip install opencv-python-headless pillow numpy scikit-learn ultralytics open-clip-torch mediapipe
+  # optionally: LAION aesthetic predictor dependencies if you want that component
+
+Checkpoints (place into ./models/):
+  - MODNet checkpoint: modnet_photographic_portrait_matting.ckpt  (from ZHKKKe/MODNet repo)
+  - YOLOv8 clothes weights: yolov8n-clothes.pt (user/copies)
+  - OpenCLIP: will be loaded by open_clip if available (from huggingface cache)
 
 """
 
-from pathlib import Path
+import argparse
 import os
+import time
+import json
+from collections import deque
+
 import cv2
 import numpy as np
-import time
-from collections import deque
-from PIL import Image, ImageSequence
-from dotenv import load_dotenv
 
-# --- Load configuration from .env with sensible defaults ---
-env_path = Path(__file__).parent / '.env'
-if env_path.exists():
-    load_dotenv(env_path)
-else:
-    print(f"Warning: .env not found at {env_path}. Using defaults; create a .env to customize.")
+# Optional heavy deps
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except Exception:
+    TORCH_AVAILABLE = False
 
-# helper to read env booleans and ints
-def get_env(key, default=None, cast=str):
-    v = os.getenv(key)
-    if v is None:
-        return default
-    try:
-        if cast is bool:
-            return v.strip().lower() in ('1','true','yes','on')
-        return cast(v)
-    except Exception:
-        return default
+try:
+    # ultralytics provides YOLOv8 interface
+    from ultralytics import YOLO
+    ULTRALYTICS_AVAILABLE = True
+except Exception:
+    ULTRALYTICS_AVAILABLE = False
 
-# configuration
-CAP_INDEX = get_env('CAP_INDEX', 0, int)
-BACKGROUND_FILES = [p.strip() for p in os.getenv('BACKGROUND_FILES', '').split(';') if p.strip()] or [str(Path.cwd() / 'bg_default.jpg')]
-MASK_HISTORY_LEN = get_env('MASK_HISTORY_LEN', 5, int)
-HARD_THRESH = get_env('HARD_THRESH', 0.5, float)
-APPLY_CLAHE = get_env('APPLY_CLAHE', True, bool)
-MORPH_KERNEL = (get_env('MORPH_KERNEL', 3, int),) * 2
-USE_GPU = get_env('USE_GPU', False, bool)
-ONNX_MODEL_PATH = os.getenv('ONNX_MODEL_PATH', '')
-EMA_ALPHA = get_env('EMA_ALPHA', 0.4, float)
-FEATHER_RADIUS = get_env('FEATHER_RADIUS', 20, int)
+try:
+    import open_clip
+    OPENCLIP_AVAILABLE = True
+except Exception:
+    OPENCLIP_AVAILABLE = False
 
-# runtime toggles
-use_hard = False
-draw_debug = True
-show_mask = False
-apply_clahe = APPLY_CLAHE
-
-# --- Try to load optional accelerated segmentation (ONNXRuntime or PyTorch) ---
-onnx_runtime = None
-onnx_sess = None
-torch = None
-torch_model = None
-use_accel = False
-
-if USE_GPU and ONNX_MODEL_PATH:
-    try:
-        import onnxruntime as ort
-        # try GPU provider first, fallback to CPU
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        sess_options = ort.SessionOptions()
-        onnx_sess = ort.InferenceSession(ONNX_MODEL_PATH, sess_options, providers=providers)
-        onnx_runtime = ort
-        use_accel = True
-        print('Using ONNXRuntime with model', ONNX_MODEL_PATH)
-    except Exception as e:
-        print('ONNXRuntime GPU model load failed, will fallback to MediaPipe. Error:', e)
-
-# Optional PyTorch model path could be added similarly; keep placeholder
-if USE_GPU and not use_accel:
-    try:
-        import torch
-        torch = torch
-        # If user provided a PyTorch model load path, try to load it here (not implemented by default)
-    except Exception:
-        torch = None
-
-# --- MediaPipe fallback (always available) ---
 try:
     import mediapipe as mp
-    mp_selfie_segmentation = mp.solutions.selfie_segmentation
-    mp_segment = mp_selfie_segmentation.SelfieSegmentation(model_selection=1)
-    print('MediaPipe loaded as fallback segmentation')
-except Exception as e:
-    mp_segment = None
-    print('MediaPipe not available; segmentation will fail without an external ONNX/PyTorch model. Error:', e)
-
-# --- Utilities: background loader (supports GIF) ---
-
-def load_bg(path):
-    ext = Path(path).suffix.lower()
-    if ext == '.gif':
-        gif = Image.open(path)
-        frames = [cv2.cvtColor(np.array(f.convert('RGB')), cv2.COLOR_RGB2BGR) for f in ImageSequence.Iterator(gif)]
-        return {'type':'gif', 'frames':frames, 'pos':0, 'playing':True}
-    else:
-        img = cv2.imread(path)
-        if img is None:
-            # placeholder plain color
-            img = np.full((480,640,3), (50,50,50), dtype=np.uint8)
-        return {'type':'img', 'img':img}
-
-bg_items = [load_bg(p) for p in BACKGROUND_FILES]
-cur_bg = 0
-
-# --- mask processing utilities ---
-
-mask_history = deque(maxlen=MASK_HISTORY_LEN)
-ema_mask = None
-
-# edge feathering by distance transform
-def feather_mask(mask, radius=FEATHER_RADIUS):
-    # mask expected float32 0..1
-    # produce soft edge by distance transform of binary mask
-    b = (mask > 0.5).astype(np.uint8)
-    if b.sum() == 0 or b.sum() == b.size:
-        return mask
-    dist_in = cv2.distanceTransform(b, cv2.DIST_L2, 5)
-    dist_out = cv2.distanceTransform(1 - b, cv2.DIST_L2, 5)
-    sdf = dist_out - dist_in
-    # normalize and map to 0..1 with sigmoid-like curve
-    soft = 1.0 / (1.0 + np.exp(-sdf / max(1.0, radius/5.0)))
-    return np.clip(soft, 0.0, 1.0)
-
-# guided filter if available
-use_guided = False
-try:
-    from cv2.ximgproc import guidedFilter
-    use_guided = True
+    MEDIAPIPE_AVAILABLE = True
 except Exception:
-    use_guided = False
+    MEDIAPIPE_AVAILABLE = False
 
-# postprocess mask: morphological, temporal EMA, blur, feathering, guided/bilateral
+try:
+    from sklearn.cluster import KMeans
+    SKLEARN_AVAILABLE = True
+except Exception:
+    SKLEARN_AVAILABLE = False
 
-def postprocess_mask(raw_mask, ema_mask_local=None):
-    # raw_mask: float32 in [0..1], shape (h,w)
-    m = raw_mask.copy()
-    # morphology: open then close to remove speckles
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, MORPH_KERNEL)
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel, iterations=1)
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel, iterations=1)
+# ----------------- Configuration -----------------
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-    # EMA temporal smoothing (faster than naive average)
-    global ema_mask
-    if ema_mask_local is None:
-        alpha = EMA_ALPHA
-    else:
-        alpha = ema_mask_local
-    if ema_mask is None:
-        ema_mask = m
-    else:
-        ema_mask = alpha * m + (1 - alpha) * ema_mask
+# Segmenter options
+MODNET_CKPT = os.path.join(MODEL_DIR, "modnet_photographic_portrait_matting.ckpt")
+YOLOV8_CKPT = os.path.join(MODEL_DIR, "yolov8n-clothes.pt")
 
-    m = ema_mask
+# ----------------- Utilities ---------------------
 
-    # guided or bilateral smoothing to preserve edges
-    if use_guided:
-        # requires color image as guidance, will be applied in caller with frame
-        pass
-    else:
-        # soft bilateral-like effect by applying small Gaussian + median
-        m = cv2.GaussianBlur(m, (7,7), 0)
-        m = cv2.medianBlur((m*255).astype(np.uint8), 5).astype(np.float32)/255.0
+def rgb_to_hex(c):
+    return '#%02x%02x%02x' % (int(c[2]), int(c[1]), int(c[0]))
 
-    # edge feathering
-    m = feather_mask(m, radius=FEATHER_RADIUS)
+# ----------------- Segmentation (MODNet) ----------
+class ModnetSegmenter:
+    """Wrapper for MODNet. If MODNet code is not installed, the class will
+    provide a fallback that uses Mediapipe (CPU) if available, or a simple
+    coarse segmentation.
+    """
+    def __init__(self, device='cuda'):
+        self.device = device if TORCH_AVAILABLE else 'cpu'
+        self.ready = False
+        self.model = None
 
-    return np.clip(m, 0.0, 1.0)
-
-# helper to run segmentation by available backend
-
-def run_segmentation(frame_bgr):
-    # return float32 mask 0..1 shape (h,w)
-    h,w = frame_bgr.shape[:2]
-    # 1) ONNXRuntime path (if enabled)
-    if onnx_sess is not None:
+        # Try to import MODNet only when requested
         try:
-            inp = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            # model-specific preprocessing: assume model wants 320x320 or 256x256; try to infer
-            # For robust behavior, read expected input shape from session
-            inp_name = onnx_sess.get_inputs()[0].name
-            shape = onnx_sess.get_inputs()[0].shape
-            # fallback size
-            target_h = int(shape[2]) if len(shape) >= 4 and shape[2] is not None else 256
-            target_w = int(shape[3]) if len(shape) >= 4 and shape[3] is not None else 256
-            small = cv2.resize(inp, (target_w, target_h))
-            x = small.astype(np.float32) / 255.0
-            # shape -> NCHW
-            if x.ndim == 3:
-                x = np.transpose(x, (2,0,1))[None, ...]
-            out = onnx_sess.run(None, {inp_name: x})
-            # take first output and resize back
-            raw = np.squeeze(out[0])
-            if raw.ndim == 3:
-                raw = raw[0]
-            mask = cv2.resize(raw, (w,h))
-            mask = (mask - mask.min()) / max(1e-6, (mask.max()-mask.min()))
-            return mask.astype(np.float32)
-        except Exception as e:
-            print('ONNXRuntime inference failed, falling back to MediaPipe. Error:', e)
-
-    # 2) PyTorch path (placeholder)
-    if torch is not None and torch_model is not None:
-        try:
-            # user-supplied torch model should return HxW mask 0..1
-            img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (320,320))
-            t = torch.from_numpy(img/255.).permute(2,0,1).unsqueeze(0).float().cuda()
-            with torch.no_grad():
-                out = torch_model(t)
-            mask = out.squeeze().cpu().numpy()
-            mask = cv2.resize(mask, (w,h))
-            return mask.astype(np.float32)
-        except Exception as e:
-            print('Torch model inference failed:', e)
-
-    # 3) MediaPipe fallback
-    if mp_segment is not None:
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        res = mp_segment.process(rgb)
-        if res is None or res.segmentation_mask is None:
-            return np.zeros((h,w), dtype=np.float32)
-        mask = res.segmentation_mask.astype(np.float32)
-        # MediaPipe provides smaller mask; resize if necessary
-        if mask.shape != (h,w):
-            mask = cv2.resize(mask, (w,h), interpolation=cv2.INTER_LINEAR)
-        return mask
-
-    # if nothing available
-    return np.zeros((h,w), dtype=np.float32)
-
-# --- Video capture loop ---
-cap = cv2.VideoCapture(CAP_INDEX)
-if not cap.isOpened():
-    raise RuntimeError(f"Can't open camera index {CAP_INDEX}")
-
-# CLAHE
-clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-
-last_time = time.time()
-frame_count = 0
-print("Controls: 1/2/... switch backgrounds, m toggle mask soft/hard, g play/pause gif, b toggle CLAHE, p toggle show mask, v toggle GPU attempt, q/Esc quit")
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-    frame = cv2.flip(frame, 1)
-    h,w = frame.shape[:2]
-
-    frame_proc = frame.copy()
-    # optional CLAHE on V channel
-    if apply_clahe:
-        hsv = cv2.cvtColor(frame_proc, cv2.COLOR_BGR2HSV)
-        v = hsv[:,:,2]
-        v = clahe.apply(v)
-        hsv[:,:,2] = v
-        frame_proc = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-
-    # run segmentation
-    raw_mask = run_segmentation(frame_proc)
-
-    # postprocess (morph, EMA, blur, feather)
-    processed = postprocess_mask(raw_mask)
-
-    # if guided filter available, refine mask with color guidance
-    if use_guided:
-        try:
-            guided = guidedFilter(cv2.cvtColor(frame_proc, cv2.COLOR_BGR2RGB), (processed*255).astype(np.uint8), 8, 1e-6)
-            processed = guided.astype(np.float32)/255.0
+            from modnet import MODNet  # local modnet.py from original repo
+            if TORCH_AVAILABLE and os.path.exists(MODNET_CKPT):
+                self.model = MODNet(backbone_pretrained=False)
+                ckpt = torch.load(MODNET_CKPT, map_location='cpu')
+                self.model.load_state_dict(ckpt)
+                if device.startswith('cuda') and torch.cuda.is_available():
+                    self.model.to(device)
+                self.model.eval()
+                self.ready = True
+            else:
+                print('[ModnetSegmenter] MODNet checkpoint not found or torch unavailable -> fallback')
         except Exception:
-            pass
+            # If modnet isn't present, try Mediapipe
+            if MEDIAPIPE_AVAILABLE:
+                mp_selfie_seg = mp.solutions.selfie_segmentation
+                self.mp_segment = mp_selfie_seg.SelfieSegmentation(model_selection=1)
+                self.ready = True
+                print('[ModnetSegmenter] Using Mediapipe fallback segmentation')
+            else:
+                print('[ModnetSegmenter] No MODNet and no Mediapipe -> will use coarse threshold fallback')
 
-    # choose hard or soft
-    if use_hard:
-        m = (processed > HARD_THRESH).astype(np.uint8)
-        m = cv2.medianBlur(m, 5)
-        m = np.expand_dims(m, 2)
-    else:
-        m = cv2.GaussianBlur(processed, (11,11), 0)
-        m = np.expand_dims(m, 2)
-
-    # select background
-    bg_item = bg_items[cur_bg]
-    if bg_item['type'] == 'gif':
-        frames = bg_item['frames']
-        idx = bg_item['pos']
-        bg_frame = frames[idx % len(frames)]
-        if bg_item.get('playing', True):
-            bg_item['pos'] = (bg_item['pos'] + 1) % len(frames)
-    else:
-        bg_frame = bg_item['img']
-
-    bg_resized = cv2.resize(bg_frame, (w,h))
-
-    # composite
-    composed = (frame.astype(np.float32) * m + bg_resized.astype(np.float32) * (1 - m)).astype(np.uint8)
-
-    # debug overlays
-    if draw_debug:
-        frame_count += 1
-        now = time.time()
-        if now - last_time >= 1.0:
-            fps = frame_count / (now - last_time)
-            last_time = now
-            frame_count = 0
-            fps_text = f"FPS: {fps:.1f}"
+    def segment(self, frame):
+        """Return float mask [0..1] same spatial size as frame."""
+        h, w = frame.shape[:2]
+        if self.model is not None:
+            # run MODNet pipeline (expects PIL-like normalized input). We'll do a simple forward.
+            import torchvision.transforms as T
+            im = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            im = cv2.resize(im, (512,512))
+            im_t = T.ToTensor()(im).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                # modnet returns tuple, mock usage here (real repo has specific api)
+                matte = self.model(im_t, True)[0][0][0].cpu().numpy()
+            matte = cv2.resize(matte, (w,h))
+            matte = np.clip(matte, 0, 1)
+            return matte
+        elif MEDIAPIPE_AVAILABLE and hasattr(self, 'mp_segment'):
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = self.mp_segment.process(rgb)
+            if res.segmentation_mask is None:
+                return np.zeros((h,w), dtype=np.float32)
+            return cv2.resize(res.segmentation_mask, (w,h))
         else:
-            fps_text = ''
-        info = f"{'HARD' if use_hard else 'SOFT'} | CLAHE:{'ON' if apply_clahe else 'OFF'} | bg:{cur_bg+1}/{len(bg_items)} {fps_text} | GPU accel:{'ON' if use_accel else 'OFF'}"
-        cv2.putText(composed, info, (10,25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+            # coarse fallback: background subtraction-ish by brightness
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            norm = (gray.astype(np.float32) - gray.mean()) / (gray.std() + 1e-6)
+            mask = (norm < 1.0).astype(np.float32)
+            return mask
 
-    cv2.imshow('Enhanced Background Replacement', composed)
-    if show_mask:
-        vis_mask = (processed*255).astype(np.uint8)
-        vis_mask_col = cv2.applyColorMap(vis_mask, cv2.COLORMAP_JET)
-        cv2.imshow('Mask (debug)', vis_mask_col)
+# ----------------- Clothes detection (YOLOv8) -------
+class ClothesDetector:
+    def __init__(self, weights_path=None, device='cuda:0'):
+        self.device = device
+        self.model = None
+        if ULTRALYTICS_AVAILABLE and weights_path and os.path.exists(weights_path):
+            try:
+                self.model = YOLO(weights_path)
+                print('[ClothesDetector] Loaded YOLOv8 weights')
+            except Exception as e:
+                print('[ClothesDetector] Failed to load YOLOv8:', e)
+                self.model = None
+        else:
+            print('[ClothesDetector] YOLOv8 not available or weights missing -> detector disabled')
 
-    key = cv2.waitKey(1) & 0xFF
-    if key == 27 or key == ord('q'):
-        break
-    elif key in (ord('1'), ord('2'), ord('3'), ord('4')):
-        idx = int(chr(key)) - 1
-        if 0 <= idx < len(bg_items):
-            cur_bg = idx
-    elif key == ord('m'):
-        use_hard = not use_hard
-    elif key == ord('g'):
-        if bg_items[cur_bg]['type'] == 'gif':
-            bg_items[cur_bg]['playing'] = not bg_items[cur_bg].get('playing', True)
-    elif key == ord('b'):
-        apply_clahe = not apply_clahe
-    elif key == ord('p'):
-        show_mask = not show_mask
-    elif key == ord('v'):
-        # toggle acceleration attempt: if user toggles, we flip trying to use onnx/pytorch if configured
-        use_accel = not use_accel
-        print('GPU accel attempt toggled ->', use_accel)
+    def detect(self, frame, conf=0.3):
+        h, w = frame.shape[:2]
+        if self.model is None:
+            return []
+        # ultralytics returns results object
+        results = self.model.predict(source=frame, conf=conf, device=self.device, imgsz=max(h,w))[0]
+        detections = []
+        for r in results.boxes:
+            bbox = r.xyxy.cpu().numpy().tolist()[0]
+            score = float(r.conf.cpu().numpy()[0]) if hasattr(r, 'conf') else float(r.prob.cpu().numpy()[0])
+            cls = int(r.cls.cpu().numpy()[0]) if hasattr(r, 'cls') else 0
+            detections.append({'bbox': bbox, 'score': score, 'class_id': cls})
+        return detections
 
-cap.release()
-cv2.destroyAllWindows()
+# ----------------- CLIP style classification  -------
+class ClipStyleClassifier:
+    def __init__(self, model_name='ViT-B-32', device='cuda'):
+        self.device = device
+        self.model = None
+        self.tokenizer = None
+        self.preprocess = None
+        self.labels = []
+        if OPENCLIP_AVAILABLE and TORCH_AVAILABLE:
+            try:
+                model, _, preprocess = open_clip.create_model_and_transforms(model_name, pretrained='openai')
+                tokenizer = open_clip.get_tokenizer(model_name)
+                model.to(device)
+                model.eval()
+                self.model = model
+                self.preprocess = preprocess
+                self.tokenizer = tokenizer
+                print('[ClipStyleClassifier] OpenCLIP loaded')
+            except Exception as e:
+                print('[ClipStyleClassifier] Failed to load OpenCLIP:', e)
+        else:
+            print('[ClipStyleClassifier] open_clip or torch not available -> classifier disabled')
 
-# ---------------- Suggestions to further improve ----------------
-# * Use a dedicated alpha-matting network (U^2-Net, MODNet, BGMatting / RVM) to get fine hair details.
-#   Run it with Torch/CUDA or convert to ONNX+TensorRT for low-latency on GPU.
-# * Use a small fast student model for real-time (MobileNet-based matting) when GPU is present.
-# * Use Temporal consistency networks (e.g., optical-flow guided smoothing) to prevent mask jitter.
-# * For streamer-grade background replacement, consider combining:
-#     - a realtime fast segmentation net for coarse mask
-#     - a matting network applied only to ROI (head/shoulders) every N frames for hair/edge detail
-# * For CPU-only machines, use quantized ONNX models or OpenVINO to accelerate inference.
-# * Consider exposing more tunables (feather radius, EMA alpha, bilateral params) in the UI or .env.
-# * If you want virtual green-screen replacement with color spill suppression, add color transfer and edge-aware despill.
+    def predict(self, pil_image, text_prompts):
+        """Zero-shot scores for a list of text_prompts. Returns list of probabilities."""
+        if self.model is None:
+            # fallback: uniform low confidence
+            return [0.0] * len(text_prompts)
+        import torch
+        img = self.preprocess(pil_image).unsqueeze(0).to(self.device)
+        texts = self.tokenizer(text_prompts)
+        with torch.no_grad():
+            image_emb = self.model.encode_image(img)
+            text_emb = self.model.encode_text(texts)
+            image_emb = image_emb / image_emb.norm(dim=-1, keepdim=True)
+            text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
+            logits = (100.0 * image_emb @ text_emb.T).softmax(dim=-1)
+            return logits.cpu().numpy()[0].tolist()
 
-# END
+# ----------------- Color extraction ----------------
+def extract_palette(bgr_roi, n_colors=3):
+    """Return top N colors as hex codes. bgr_roi is an HxWx3 numpy array."""
+    if not SKLEARN_AVAILABLE:
+        # fallback: compute dominant by mean per channel
+        avg = bgr_roi.reshape(-1,3).mean(axis=0)
+        return [rgb_to_hex(avg)]
+    data = bgr_roi.reshape(-1,3).astype(np.float32)
+    # sample if large
+    if data.shape[0] > 20000:
+        idx = np.random.choice(data.shape[0], 20000, replace=False)
+        data = data[idx]
+    kmeans = KMeans(n_clusters=n_colors, random_state=0).fit(data)
+    centers = kmeans.cluster_centers_.astype(np.uint8)
+    colors = [rgb_to_hex(c[::-1]) for c in centers]  # convert BGR->RGB in hex
+    return colors
 
-# ---------- Настройки (подкорректируй пути) ----------
-background_files = [
-    r"C:\Users\4ekwk\Downloads\7beN-2699045384.gif"
-]
-cap_index = 0            # индекс камеры
-mask_history_len = 5     # усреднение по N кадрам
-hard_thresh = 0.5        # порог для бинаризации
-apply_clahe = True       # авто улучшение освещённости
-morph_kernel = (3,3)     # ядро для морфологии
-draw_debug = True
+# ----------------- Aesthetic (optional) -------------
+class AestheticPredictor:
+    def __init__(self):
+        self.ready = False
+        try:
+            # user may implement LAION predictor here
+            from aesthetic_predictor import AestheticPredictor as AP
+            self.model = AP()
+            self.ready = True
+        except Exception:
+            print('[AestheticPredictor] Not available -> skipping aesthetic scoring')
 
-# ------------------------------------------------------
-mp_selfie_segmentation = mp.solutions.selfie_segmentation
-segment = mp_selfie_segmentation.SelfieSegmentation(model_selection=1)
+    def score(self, pil_image):
+        if not self.ready:
+            return None
+        return float(self.model.predict(pil_image))
 
-cap = cv2.VideoCapture(cap_index)
-if not cap.isOpened():
-    raise RuntimeError("Не удалось открыть камеру")
+# ----------------- Pipeline -------------------------
 
-# Загрузка фонов (поддержка gif)
-def load_bg(path):
-    ext = os.path.splitext(path)[1].lower()
-    if ext in (".gif",):
-        gif = Image.open(path)
-        frames = [cv2.cvtColor(np.array(f.convert("RGB")), cv2.COLOR_RGB2BGR)
-                  for f in ImageSequence.Iterator(gif)]
-        return {"type":"gif", "frames": frames, "pos":0, "playing":True}
-    else:
-        img = cv2.imread(path)
-        if img is None:
-            # создаём цветной фон, если не найден
-            img = np.full((480,640,3), (50,50,50), dtype=np.uint8)
-        return {"type":"img", "img": img}
-
-bg_items = [load_bg(p) for p in background_files]
-cur_bg = 0
-
-mask_history = deque(maxlen=mask_history_len)
-use_hard = False
-
-# CLAHE для V-канала
-clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-
-last_time = time.time()
-frame_count = 0
-
-print("Controls: 1/2/3 switch backgrounds, m toggle mask soft/hard, g play/pause gif, b toggle CLAHE, q/Esc quit")
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-    frame = cv2.flip(frame, 1)
+def process_frame(frame, segmenter, detector, classifier, aestheticer):
     h, w = frame.shape[:2]
+    # 1) person mask
+    mask = segmenter.segment(frame)
+    mask_3 = np.expand_dims(mask, axis=2)
 
-    # 1) опционально улучшаем освещённость (CLAHE на V)
-    frame_proc = frame.copy()
-    if apply_clahe:
-        hsv = cv2.cvtColor(frame_proc, cv2.COLOR_BGR2HSV)
-        v = hsv[:,:,2]
-        v = clahe.apply(v)
-        hsv[:,:,2] = v
-        frame_proc = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-
-    rgb = cv2.cvtColor(frame_proc, cv2.COLOR_BGR2RGB)
-    result = segment.process(rgb)
-    mask = result.segmentation_mask  # float32 [0..1]
-
-    # 2) базовая морфология (убираем шум)
-    mask = cv2.erode(mask, np.ones(morph_kernel, np.uint8), iterations=1)
-    mask = cv2.dilate(mask, np.ones((5,5), np.uint8), iterations=1)
-
-    # 3) сглаживание по времени
-    mask_history.append(mask)
-    avg_mask = np.mean(mask_history, axis=0)
-
-    # 4) для вывода: либо soft (градиент), либо hard (0/1)
-    if use_hard:
-        m = (avg_mask > hard_thresh).astype(np.uint8)
-        # можно немного расширить & затем сузить, чтобы убрать "хвосты"
-        m = cv2.medianBlur(m, 5)
-        m = np.expand_dims(m, axis=2)
+    # 2) compose transparent person (crop bbox by mask)
+    # compute tight bbox from mask
+    ys, xs = np.where(mask > 0.1)
+    if len(xs) == 0:
+        person_bbox = [0,0,w,h]
+        cropped = frame.copy()
     else:
-        m = cv2.GaussianBlur(avg_mask, (15,15), 0)
-        m = np.expand_dims(m, axis=2)
-        m = np.clip(m, 0, 1)
+        x1, x2 = xs.min(), xs.max()
+        y1, y2 = ys.min(), ys.max()
+        person_bbox = [int(x1), int(y1), int(x2), int(y2)]
+        cropped = frame[person_bbox[1]:person_bbox[3], person_bbox[0]:person_bbox[2]]
 
-    # 5) подбираем фон
-    bg_item = bg_items[cur_bg]
-    if bg_item["type"] == "gif":
-        frames = bg_item["frames"]
-        idx = bg_item["pos"]
-        bg_frame = frames[idx % len(frames)]
-        if bg_item.get("playing", True):
-            bg_item["pos"] = (bg_item["pos"] + 1) % len(frames)
-    else:
-        bg_frame = bg_item["img"]
+    # 3) clothes detection
+    dets = detector.detect(frame) if detector is not None else []
 
-    bg_resized = cv2.resize(bg_frame, (w, h))
+    # 4) palette extraction (on whole person crop)
+    colors = []
+    if cropped.size != 0:
+        colors = extract_palette(cropped, n_colors=3)
 
-    # 6) комбинируем
-    # m.shape == (h,w,1); frame is uint8
-    # ensure float computation then back to uint8
-    composed = (frame.astype(np.float32) * (1 - m) + bg_resized.astype(np.float32) * m).astype(np.uint8)
+    # 5) style classification with CLIP
+    style_scores = {}
+    prompts = [
+        'formal clothing', 'casual clothing', 'sporty outfit', 'evening wear',
+        'streetwear', 'gothic clothing', 'cosplay outfit', 'workwear uniform'
+    ]
+    from PIL import Image
+    pil_crop = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
+    if classifier is not None:
+        probs = classifier.predict(pil_crop, prompts)
+        style_scores = dict(zip(prompts, probs))
 
-    # 7) отрисовка UI
-    if draw_debug:
-        frame_count += 1
-        now = time.time()
-        if now - last_time >= 1.0:
-            fps = frame_count / (now - last_time)
-            last_time = now
-            frame_count = 0
-            fps_text = f"FPS: {fps:.1f}"
+    # 6) aesthetic score
+    aest = aestheticer.score(pil_crop) if aestheticer is not None else None
+
+    result = {
+        'bbox_person': person_bbox,
+        'colors': colors,
+        'clothes_detections': dets,
+        'style_scores': style_scores,
+        'aesthetic': aest,
+        'mask_summary': {
+            'mask_mean': float(np.mean(mask)),
+            'mask_sum': int(np.sum(mask>0.1))
+        }
+    }
+    return result, mask
+
+# ----------------- Main / CLI ----------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--source', default=0, help='camera index or path to video/file')
+    parser.add_argument('--use_gpu', action='store_true')
+    parser.add_argument('--modnet', action='store_true', help='use MODNet if available')
+    parser.add_argument('--yolov8', action='store_true', help='use YOLOv8 clothes detector')
+    parser.add_argument('--clip', action='store_true', help='use OpenCLIP for style classification')
+    parser.add_argument('--show', action='store_true', help='show GUI window')
+    args = parser.parse_args()
+
+    device = 'cuda' if args.use_gpu and TORCH_AVAILABLE and torch.cuda.is_available() else 'cpu'
+    print('Device chosen:', device)
+
+    # init modules
+    segmenter = ModnetSegmenter(device=device) if args.modnet else ModnetSegmenter(device='cpu')
+    detector = ClothesDetector(weights_path=YOLOV8_CKPT, device='gpu' if args.use_gpu else 'cpu') if args.yolov8 else None
+    classifier = ClipStyleClassifier(device=device) if args.clip else None
+    aestheticer = AestheticPredictor()
+
+    # video source
+    cap = cv2.VideoCapture(int(args.source) if str(args.source).isdigit() else args.source)
+    if not cap.isOpened():
+        print('Failed to open source:', args.source)
+        return
+
+    print('Press q or Esc to quit')
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.flip(frame, 1)
+
+        out, mask = process_frame(frame, segmenter, detector, classifier, aestheticer)
+
+        # compose debug overlay: draw bbox, colors
+        vis = frame.copy()
+        x1,y1,x2,y2 = out['bbox_person']
+        cv2.rectangle(vis, (x1,y1), (x2,y2), (0,255,0), 2)
+        # draw palette
+        for i,hexc in enumerate(out['colors']):
+            cv2.putText(vis, hexc, (10, 30 + i*20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+            cv2.rectangle(vis, (120 + i*40, 10), (150 + i*40, 30), tuple(int(hexc.lstrip('#')[j:j+2],16) for j in (4,2,0)), -1)
+
+        # show simple style top
+        if out['style_scores']:
+            # show best label
+            best = max(out['style_scores'].items(), key=lambda x: x[1])
+            cv2.putText(vis, f"style: {best[0]} {best[1]:.2f}", (10, frame.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+        if args.show:
+            cv2.imshow('pipeline', vis)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord('q')):
+                break
         else:
-            fps_text = ""
-        info = f"{'HARD' if use_hard else 'SOFT'} mask | CLAHE: {'ON' if apply_clahe else 'OFF'} | bg:{cur_bg+1}/{len(bg_items)} {fps_text}"
-        cv2.putText(composed, info, (10,25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+            # if headless, dump JSON to stdout occasionally
+            print(json.dumps(out))
+            time.sleep(0.2)
 
-    cv2.imshow("Enhanced Background Replacement", composed)
+    cap.release()
+    cv2.destroyAllWindows()
 
-    key = cv2.waitKey(30) & 0xFF
-    if key == 27 or key == ord('q'):  # ESC or q
-        break
-    elif key in (ord('1'), ord('2'), ord('3')):
-        idx = int(chr(key)) - 1
-        if 0 <= idx < len(bg_items):
-            cur_bg = idx
-    elif key == ord('m'):
-        use_hard = not use_hard
-    elif key == ord('g'):
-        # toggle gif play/pause if current bg is gif
-        if bg_items[cur_bg]["type"] == "gif":
-            bg_items[cur_bg]["playing"] = not bg_items[cur_bg].get("playing", True)
-    elif key == ord('b'):
-        apply_clahe = not apply_clahe
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == '__main__':
+    main()
