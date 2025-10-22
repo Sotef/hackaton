@@ -1,0 +1,59 @@
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.log
+*.sqlite3
+
+# === Virtual environment ===
+venv/
+.env/
+.env.bak/
+.venv/
+
+# === IDE / Editors ===
+.vscode/
+.idea/
+*.code-workspace
+
+# === OS junk ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Data / Models ===
+models/
+weights/
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.safetensors
+*.ckpt
+
+# === Cache / Temp ===
+tmp/
+temp/
+cache/
+logs/
+outputs/
+runs/
+__output__/
+
+# === Project-specific ===
+*.mp4
+*.avi
+*.jpg
+*.jpeg
+*.png
+backgrounds/
+test_images/
+recordings/
+
+# === Pip / Build ===
+build/
+dist/
+*.egg-info/
