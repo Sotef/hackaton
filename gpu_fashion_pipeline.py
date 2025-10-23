@@ -24,6 +24,14 @@ import cv2
 import numpy as np
 from PIL import Image, ImageSequence
 
+# импорт modnet
+try:
+    from models.modnet import MODNet
+except ImportError:
+    from modnet import MODNet
+
+
+
 # optional heavy deps
 try:
     import torch
@@ -76,32 +84,48 @@ class ModnetSegmenter:
         self.ready = False
 
         if use_modnet and TORCH_AVAILABLE:
-            # try to import MODNet (user must have modnet.py available or installed)
             try:
-                from modnet import MODNet  # expects local modnet repo or pip package
+                # корректный импорт MODNet (установленный как пакет)
+                try:
+                    from models.modnet import MODNet
+                except ImportError:
+                    from modnet import MODNet
+
                 if os.path.exists(MODNET_CKPT):
+                    print(f"[Segmenter] Loading MODNet checkpoint from: {MODNET_CKPT}")
                     ckpt = torch.load(MODNET_CKPT, map_location='cpu')
+
+                    # создаем модель и грузим веса
                     self.model = MODNet(backbone_pretrained=False)
                     self.model.load_state_dict(ckpt)
+
                     if self.device.startswith('cuda') and torch.cuda.is_available():
                         self.model.to(self.device)
+                        print(f"[Segmenter] MODNet moved to GPU ({self.device})")
+                    else:
+                        print("[Segmenter] MODNet running on CPU")
+
                     self.model.eval()
                     self.ready = True
-                    print("[Segmenter] MODNet loaded")
-                else:
-                    print("[Segmenter] MODNet checkpoint missing, falling back")
-            except Exception as e:
-                print("[Segmenter] MODNet import failed:", e)
+                    print("[Segmenter] MODNet loaded successfully ✅")
 
+                else:
+                    print(f"[Segmenter] ❌ MODNet checkpoint missing at {MODNET_CKPT}, falling back")
+
+            except Exception as e:
+                print(f"[Segmenter] MODNet init failed: {type(e).__name__}: {e}")
+
+        # fallback → Mediapipe or brightness mask
         if not self.ready:
             if MEDIAPIPE_AVAILABLE:
                 mp_selfie_seg = mp.solutions.selfie_segmentation
                 self.mp_segment = mp_selfie_seg.SelfieSegmentation(model_selection=1)
                 self.ready = True
-                print("[Segmenter] Using Mediapipe SelfieSegmentation")
+                print("[Segmenter] Using Mediapipe SelfieSegmentation (fallback)")
             else:
                 print("[Segmenter] No MODNet and no Mediapipe: using brightness fallback")
                 self.ready = True
+
 
     def segment(self, frame):
         """

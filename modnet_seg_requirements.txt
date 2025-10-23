@@ -1,4 +1,4 @@
-﻿torch>=1.12.0
+torch>=1.12.0
 torchvision>=0.13.0
 opencv-python>=4.5.5
 pillow>=9.0.0

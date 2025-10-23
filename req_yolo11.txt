@@ -1,0 +1,17 @@
+
+# === Core ===
+ultralytics==8.3.22        # YOLO11 models (n/s/m/l/x, det/seg/pose)
+opencv-python==4.10.0.84   # Video/image capture and visualization
+numpy>=1.23.5
+torch>=2.2.0
+torchvision>=0.17.0
+
+# === Export/ONNX/TFLite support ===
+onnx>=1.15.0
+onnxruntime>=1.19.0
+tensorflow==2.13.0
+tensorflowjs==4.22.0
+
+# === Utils ===
+tqdm
+pillow
