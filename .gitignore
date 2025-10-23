@@ -24,7 +24,7 @@ Thumbs.db
 desktop.ini
 
 # === Data / Models ===
-models/
+# models/
 weights/
 checkpoints/
 *.pt
