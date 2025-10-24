@@ -26,7 +26,7 @@ from PIL import Image, ImageSequence
 
 # импорт modnet
 try:
-    from models.modnet import MODNet
+    from MODNet.src.models.modnet import MODNet
 except ImportError:
     from modnet import MODNet
 
