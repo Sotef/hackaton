@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WS Segmentation Test</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; margin: 16px; }
+    video, img, canvas { border: 1px solid #ccc; display:block; margin-bottom:8px; }
+    #controls { margin-bottom:12px; }
+    label { margin-right:8px; }
+  </style>
+</head>
+<body>
+  <h3>WebSocket Segmentation Test</h3>
+
+  <div id="controls">
+    <button id="btnConnect">Connect WS</button>
+    <button id="btnStart" disabled>Start</button>
+    <button id="btnStop" disabled>Stop</button>
+    <label>FPS: <input id="inpFps" type="number" value="6" min="1" max="30" style="width:60px"></label>
+    <label>Quality (JPEG 0.1-1): <input id="inpQuality" type="number" step="0.1" value="0.7" min="0.1" max="1" style="width:80px"></label>
+    <select id="selReturn"><option value="mask">mask</option><option value="composite">composite</option><option value="rgba_png">rgba</option></select>
+    <span id="status" style="margin-left:12px">Disconnected</span>
+  </div>
+
+  <div style="display:flex;gap:16px;flex-wrap:wrap;">
+    <div>
+      <div>Local camera</div>
+      <video id="video" autoplay playsinline width="480" height="360"></video>
+    </div>
+    <div>
+      <div>Server result</div>
+      <img id="out" width="480" height="360" alt="result" />
+    </div>
+  </div>
+
+  <script>
+    let ws = null;
+    let sending = false;
+    let sendInterval = null;
+    const video = document.getElementById('video');
+    const out = document.getElementById('out');
+    const status = document.getElementById('status');
+    const btnConnect = document.getElementById('btnConnect');
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
+
+    async function startCamera(){
+      try{
+        const stream = await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}, audio:false});
+        video.srcObject = stream;
+        await video.play();
+      }catch(e){
+        alert('Camera access error: '+e.message);
+      }
+    }
+
+    startCamera();
+
+    function connectWS(){
+      if(ws && ws.readyState === WebSocket.OPEN) return;
+  // pick host intelligently: if page has a hostname use it, otherwise default to 127.0.0.1
+  const host = (location.hostname && location.hostname !== '') ? location.hostname : '127.0.0.1';
+  const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+  const wsUrl = `${proto}//${host}:8000/segment`;
+  console.log('Connecting to', wsUrl);
+  ws = new WebSocket(wsUrl);
+      ws.onopen = () => {
+        status.textContent = 'Connected';
+        btnStart.disabled = false;
+        btnStop.disabled = true;
+        btnConnect.textContent = 'Reconnect';
+        // inform server we started
+        ws.send(JSON.stringify({type:'start', meta:{}}));
+      };
+      ws.onmessage = ev => {
+        try{
+          const msg = JSON.parse(ev.data);
+          if(msg.type === 'result'){
+            // msg.data is base64 PNG
+            out.src = 'data:image/png;base64,' + msg.data;
+            // optionally show latency
+            // console.log('latency', msg.meta && msg.meta.latency_ms);
+          } else if(msg.type === 'status'){
+            console.log('status', msg);
+          } else if(msg.type === 'error'){
+            console.error('server error', msg);
+          }
+        }catch(e){
+          console.warn('non-json message', ev.data);
+        }
+      };
+      ws.onclose = () => { status.textContent = 'Disconnected'; btnStart.disabled = true; btnStop.disabled = true; };
+      ws.onerror = e => { console.error('ws error', e); };
+    }
+
+    function startSending(){
+      if(!ws || ws.readyState !== WebSocket.OPEN){ alert('WebSocket not connected'); return; }
+      if(sending) return;
+      sending = true;
+      btnStart.disabled = true; btnStop.disabled = false;
+      const fps = Math.max(1, parseInt(document.getElementById('inpFps').value || 6));
+      const quality = parseFloat(document.getElementById('inpQuality').value || 0.7);
+      const ret = document.getElementById('selReturn').value || 'mask';
+      // config server
+      ws.send(JSON.stringify({type:'config', config:{return: ret}}));
+
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth || 640; canvas.height = video.videoHeight || 480;
+      const ctx = canvas.getContext('2d');
+      sendInterval = setInterval(()=>{
+        ctx.drawImage(video,0,0,canvas.width,canvas.height);
+        // use jpeg for smaller transport; server decodes either jpeg/png
+        const dataUrl = canvas.toDataURL('image/jpeg', quality);
+        const b64 = dataUrl.split(',')[1];
+        const frame_id = Date.now().toString();
+        ws.send(JSON.stringify({type:'frame', frame_id: frame_id, data: b64, meta:{fps}}));
+      }, 1000 / fps);
+    }
+
+    function stopSending(){
+      sending = false;
+      if(sendInterval) clearInterval(sendInterval);
+      btnStart.disabled = false; btnStop.disabled = true;
+      if(ws && ws.readyState === WebSocket.OPEN){ ws.send(JSON.stringify({type:'stop'})); }
+    }
+
+    btnConnect.onclick = connectWS;
+    btnStart.onclick = startSending;
+    btnStop.onclick = stopSending;
+
+    // allow auto-connect for convenience
+    // connectWS();
+  </script>
+</body>
+</html>
