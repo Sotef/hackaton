@@ -9,6 +9,8 @@ __pycache__/
 
 # === Virtual environment ===
 venv/
+venv310/
+venv_gpu/
 .env/
 .env.bak/
 .venv/
