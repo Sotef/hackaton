@@ -1,3 +1,2 @@
-import cv2
-cap = cv2.VideoCapture(0)
-print(cap.isOpened())
+import onnxruntime as ort
+print(ort.get_device())  # должно вывести 'GPU'
